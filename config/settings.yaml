@@ -1,0 +1,45 @@
+# LinkedIn Scraper Configuration
+# Advanced settings for bulk profile scraping
+
+# Scraping Settings
+scraping:
+  headless: false  # Set to true for production
+  max_profiles_per_search: 100
+  delay_between_profiles: [15, 30]  # [min, max] seconds
+  max_retries: 3
+  timeout: 30000  # milliseconds
+  use_stealth: true
+
+# Browser Settings
+browser:
+  viewport_width: 1920
+  viewport_height: 1080
+  use_proxy: false
+  proxy_server: ""
+
+# Database Settings
+database:
+  path: "data/linkedin_scraper.db"
+  auto_backup: true
+  backup_interval: 100  # profiles
+
+# Export Settings
+export:
+  auto_export: true
+  formats: ["json", "csv", "excel"]
+  export_path: "data/exports"
+  min_completeness: 50  # percentage
+
+# Logging Settings
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/scraper.log"
+  max_size_mb: 10
+
+# Anti-Detection Settings
+anti_detection:
+  random_delays: true
+  human_behavior: true
+  fingerprint_spoofing: true
+  adaptive_rate_limiting: true
+  randomize_user_agent: true
