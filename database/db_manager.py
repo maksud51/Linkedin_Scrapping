@@ -82,19 +82,65 @@ class DatabaseManager:
             )
         ''')
         
+        # Scraping history table - tracks all user inputs/sessions
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scraping_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_type TEXT NOT NULL,
+                query_or_source TEXT,
+                total_found INTEGER DEFAULT 0,
+                total_requested INTEGER DEFAULT 0,
+                scraped_count INTEGER DEFAULT 0,
+                pending_count INTEGER DEFAULT 0,
+                failed_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        ''')
+        
+        # Profile queue - tracks which profiles belong to which session
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS profile_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                history_id INTEGER,
+                profile_url TEXT NOT NULL,
+                queue_position INTEGER,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (history_id) REFERENCES scraping_history(id)
+            )
+        ''')
+        
         # Create indexes for faster queries
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON profiles(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON profiles(profile_url)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_created ON profiles(created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_id ON profile_queue(history_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_queue_status ON profile_queue(status)')
         
         conn.commit()
         conn.close()
         
         logger.info("Database initialized")
     
-    def _get_connection(self) -> sqlite3.Connection:
-        """Get database connection"""
-        return sqlite3.connect(str(self.db_path))
+    def _get_connection(self, retries: int = 3) -> sqlite3.Connection:
+        """Get database connection with timeout, WAL mode, and retry logic"""
+        for attempt in range(retries):
+            try:
+                conn = sqlite3.connect(str(self.db_path), timeout=60.0)
+                # Enable WAL mode for better concurrent access
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=60000")
+                return conn
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e) and attempt < retries - 1:
+                    import time
+                    logger.warning(f"Database locked, retrying in 2 seconds... (attempt {attempt + 1}/{retries})")
+                    time.sleep(2)
+                else:
+                    raise
+        raise sqlite3.OperationalError("Could not connect to database after retries")
     
     def add_profiles(self, profile_urls: List[str], session_id: Optional[int] = None) -> int:
         """Add profiles to scraping queue"""
@@ -132,17 +178,17 @@ class DatabaseManager:
         return added
     
     def save_profile_data(self, profile_url: str, data: Dict, completeness: float = 0):
-        """Save scraped profile data"""
+        """Save scraped profile data - uses INSERT OR REPLACE for robustness"""
         conn = self._get_connection()
         cursor = conn.cursor()
         
         try:
+            profile_hash = hashlib.md5(profile_url.encode()).hexdigest()
             cursor.execute('''
-                UPDATE profiles 
-                SET status = 'completed', data = ?, scraped_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP, data_completeness = ?
-                WHERE profile_url = ?
-            ''', (json.dumps(data, ensure_ascii=False, indent=2), completeness, profile_url))
+                INSERT OR REPLACE INTO profiles 
+                (profile_url, profile_hash, status, data, scraped_at, updated_at, data_completeness)
+                VALUES (?, ?, 'completed', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+            ''', (profile_url, profile_hash, json.dumps(data, ensure_ascii=False, indent=2), completeness))
             
             conn.commit()
             logger.debug(f"Saved profile data: {data.get('name', 'Unknown')}")
@@ -209,6 +255,56 @@ class DatabaseManager:
             conn.close()
         
         return profiles
+    
+    def get_failed_profiles(self, limit: int = 100) -> List[str]:
+        """Get failed profiles for re-scraping"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT profile_url FROM profiles 
+                WHERE status = 'failed' AND retry_count < 5
+                ORDER BY updated_at DESC
+                LIMIT ?
+            ''', (limit,))
+            
+            profiles = [row[0] for row in cursor.fetchall()]
+            
+        finally:
+            conn.close()
+        
+        return profiles
+    
+    def reset_failed_to_pending(self, profile_urls: List[str] = None):
+        """Reset failed profiles back to pending status for re-scraping"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            if profile_urls:
+                # Reset specific profiles
+                for url in profile_urls:
+                    cursor.execute('''
+                        UPDATE profiles 
+                        SET status = 'pending', error = NULL
+                        WHERE profile_url = ? AND status = 'failed'
+                    ''', (url,))
+            else:
+                # Reset all failed profiles with retry_count < 5
+                cursor.execute('''
+                    UPDATE profiles 
+                    SET status = 'pending', error = NULL
+                    WHERE status = 'failed' AND retry_count < 5
+                ''')
+            
+            affected = cursor.rowcount
+            conn.commit()
+            logger.info(f"Reset {affected} failed profiles to pending")
+            return affected
+            
+        finally:
+            conn.close()
     
     def get_scraping_stats(self) -> Dict:
         """Get comprehensive scraping statistics"""
@@ -334,8 +430,8 @@ class DatabaseManager:
         
         logger.info(f"Exported {len(data)} profiles to {filepath}")
     
-    def get_failed_profiles(self) -> List[Dict]:
-        """Get failed profile URLs with errors"""
+    def get_failed_profiles_with_details(self) -> List[Dict]:
+        """Get failed profile URLs with error details"""
         conn = self._get_connection()
         cursor = conn.cursor()
         
@@ -383,3 +479,195 @@ class DatabaseManager:
             return f"{size_mb:.2f} MB"
         except:
             return "Unknown"
+    
+    # =================== HISTORY TRACKING METHODS ===================
+    
+    def create_scraping_history(self, session_type: str, query_or_source: str, 
+                                total_found: int, total_requested: int) -> int:
+        """Create a new scraping history entry"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                INSERT INTO scraping_history 
+                (session_type, query_or_source, total_found, total_requested, status)
+                VALUES (?, ?, ?, ?, 'active')
+            ''', (session_type, query_or_source, total_found, total_requested))
+            
+            conn.commit()
+            history_id = cursor.lastrowid
+            logger.info(f"Created scraping history #{history_id}: {session_type} - {query_or_source}")
+            return history_id
+            
+        finally:
+            conn.close()
+    
+    def add_profiles_to_queue(self, history_id: int, profile_urls: List[str]) -> int:
+        """Add profiles to queue with position tracking"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        added = 0
+        for position, url in enumerate(profile_urls, 1):
+            try:
+                # Check if already in queue for this session
+                cursor.execute('''
+                    SELECT 1 FROM profile_queue 
+                    WHERE history_id = ? AND profile_url = ?
+                ''', (history_id, url))
+                
+                if cursor.fetchone() is None:
+                    cursor.execute('''
+                        INSERT INTO profile_queue 
+                        (history_id, profile_url, queue_position, status)
+                        VALUES (?, ?, ?, 'pending')
+                    ''', (history_id, url, position))
+                    added += 1
+                    
+            except sqlite3.IntegrityError:
+                continue
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Added {added} profiles to queue for history #{history_id}")
+        return added
+    
+    def update_queue_status(self, history_id: int, profile_url: str, status: str):
+        """Update profile status in queue"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE profile_queue 
+                SET status = ?
+                WHERE history_id = ? AND profile_url = ?
+            ''', (status, history_id, profile_url))
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def get_unscraped_profiles(self, profile_urls: List[str]) -> List[str]:
+        """Filter out already scraped profiles from list - return only unscraped ones"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        unscraped = []
+        try:
+            for url in profile_urls:
+                cursor.execute('''
+                    SELECT 1 FROM profiles 
+                    WHERE profile_url = ? AND status = 'completed' AND data IS NOT NULL
+                ''', (url,))
+                
+                if cursor.fetchone() is None:
+                    unscraped.append(url)
+            
+            logger.info(f"Filtered profiles: {len(profile_urls)} total, {len(unscraped)} unscraped, {len(profile_urls) - len(unscraped)} already scraped")
+            
+        finally:
+            conn.close()
+        
+        return unscraped
+    
+    def update_history_stats(self, history_id: int):
+        """Update scraping history statistics"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as scraped,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+                FROM profile_queue
+                WHERE history_id = ?
+            ''', (history_id,))
+            
+            stats = cursor.fetchone()
+            
+            cursor.execute('''
+                UPDATE scraping_history 
+                SET scraped_count = ?, pending_count = ?, failed_count = ?
+                WHERE id = ?
+            ''', (stats[1] or 0, stats[2] or 0, stats[3] or 0, history_id))
+            
+            # Check if completed
+            if stats[2] == 0:  # No pending
+                cursor.execute('''
+                    UPDATE scraping_history 
+                    SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (history_id,))
+            
+            conn.commit()
+            
+        finally:
+            conn.close()
+    
+    def get_scraping_history(self, limit: int = 20) -> List[Dict]:
+        """Get recent scraping history"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT id, session_type, query_or_source, total_found, total_requested,
+                       scraped_count, pending_count, failed_count, status, created_at, completed_at
+                FROM scraping_history
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (limit,))
+            
+            history = []
+            for row in cursor.fetchall():
+                history.append({
+                    'id': row[0],
+                    'type': row[1],
+                    'query': row[2],
+                    'total_found': row[3],
+                    'requested': row[4],
+                    'scraped': row[5],
+                    'pending': row[6],
+                    'failed': row[7],
+                    'status': row[8],
+                    'created_at': row[9],
+                    'completed_at': row[10]
+                })
+            
+            return history
+            
+        finally:
+            conn.close()
+    
+    def get_pending_from_history(self, history_id: int = None, limit: int = 100) -> List[str]:
+        """Get pending profiles from specific history or most recent active"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            if history_id:
+                cursor.execute('''
+                    SELECT profile_url FROM profile_queue
+                    WHERE history_id = ? AND status = 'pending'
+                    ORDER BY queue_position
+                    LIMIT ?
+                ''', (history_id, limit))
+            else:
+                # Get from most recent active session
+                cursor.execute('''
+                    SELECT pq.profile_url FROM profile_queue pq
+                    JOIN scraping_history sh ON pq.history_id = sh.id
+                    WHERE pq.status = 'pending' AND sh.status = 'active'
+                    ORDER BY sh.created_at DESC, pq.queue_position
+                    LIMIT ?
+                ''', (limit,))
+            
+            return [row[0] for row in cursor.fetchall()]
+            
+        finally:
+            conn.close()
